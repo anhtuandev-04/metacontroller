@@ -1,0 +1,460 @@
+# /// script
+# dependencies = [
+#   "accelerate",
+#   "fire",
+#   "memmap-replay-buffer>=0.0.23",
+#   "metacontroller-pytorch>=0.1.0",
+#   "torch",
+#   "einops",
+#   "tqdm",
+#   "wandb",
+#   "gymnasium",
+#   "minigrid",
+#   "matplotlib"
+# ]
+# ///
+
+import fire
+from tqdm import tqdm
+from pathlib import Path
+from collections import defaultdict
+
+import numpy as np
+import torch
+from torch.optim import AdamW
+from torch.nn import init
+import torch.nn as nn
+
+from accelerate import Accelerator
+from memmap_replay_buffer import ReplayBuffer
+from einops import rearrange
+
+import matplotlib.pyplot as plt
+import wandb
+
+from metacontroller import MetaController, Transformer
+from metacontroller.transformer_with_resnet import TransformerWithResnet
+
+import gymnasium as gym
+from gymnasium.envs.registration import register
+
+# Import PinPad environment classes from gather_pinpad_trajs.py
+from minigrid.wrappers import FullyObsWrapper
+from gather_pinpad_trajs import PinPad, OneHotFullyObsWrapper
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def initialize_weights_xavier(module):
+    if isinstance(module, nn.Linear):
+        init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            init.zeros_(module.bias)
+    elif isinstance(module, nn.Conv2d):
+        init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            init.zeros_(module.bias)
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
+
+def create_pinpad_env(env_id, num_objects, obj_seq, room_size, num_rows, num_cols):
+    """Register and create a PinPad environment."""
+    if env_id in gym.envs.registry:
+        del gym.envs.registry[env_id]
+
+    register(
+        id=env_id,
+        entry_point=PinPad,
+        kwargs={
+            "num_objects": num_objects,
+            "obj_seq": obj_seq,
+            "room_size": room_size,
+            "num_rows": num_rows,
+            "num_cols": num_cols
+        },
+    )
+
+    env = gym.make(env_id, obj_seq=obj_seq)
+    #env = OneHotFullyObsWrapper(env)
+    env = FullyObsWrapper(env)
+    return env
+
+
+def visualize_switch_betas_vs_labels(
+    switch_betas,      # (B, T-1)
+    labels,            # (B, T)
+    episode_lens,      # (B,) or None
+    gradient_step,
+    num_samples=3,
+):
+    """
+    Visualize switch betas vs GT labels for randomly sampled sequences in the batch.
+    Logs a single stacked figure to wandb.
+    """
+    B, T_minus_1 = switch_betas.shape
+
+    # randomly sample sequences from the batch
+    num_samples = min(num_samples, B)
+    sample_indices = np.random.choice(B, size=num_samples, replace=False)
+
+    # create figure with 2 * num_samples subplots (labels + switch_betas for each sample)
+    fig, axes = plt.subplots(2 * num_samples, 1, figsize=(12, 3 * num_samples), sharex=False)
+    fig.suptitle(f'Step {gradient_step} | Note: -1 in labels = explore (no specific subgoal)', fontsize=10)
+
+    for i, idx in enumerate(sample_indices):
+        # get episode length for this sample (if available)
+        if episode_lens is not None:
+            ep_len = int(episode_lens[idx].item())
+        else:
+            ep_len = T_minus_1
+
+        # extract data for this sample
+        sample_switch_betas = switch_betas[idx, :ep_len-1].detach().cpu()  # (T-1,)
+        sample_labels = labels[idx, :ep_len].cpu()  # (T,)
+
+        # get axes for this sample pair
+        ax1 = axes[2 * i]      # labels
+        ax2 = axes[2 * i + 1]  # switch betas
+
+        # top plot: labels (align with switch_betas by using labels[:-1])
+        ax1.plot(sample_labels[:-1].numpy(), label=f'labels (sample {idx})', color='red')
+        ax1.set_ylabel('labels')
+        ax1.legend(loc='upper right')
+
+        # bottom plot: switch betas
+        ax2.plot(sample_switch_betas.numpy(), label='switch betas', linewidth=2)
+        ax2.set_xlabel('timesteps')
+        ax2.set_ylabel('switch betas')
+        ax2.legend(loc='upper right')
+
+    plt.tight_layout()
+
+    # log to wandb
+    wandb.log({
+        f"switch_betas_vs_labels/step_{gradient_step}": wandb.Image(fig)
+    }, step=gradient_step)
+
+    plt.close(fig)
+
+
+# ============================================================================
+# Training
+# ============================================================================
+
+def train(
+    input_dir = "pinpad_demonstrations",
+    env_id = "PinPad-v0",
+    # PinPad environment parameters (must match the demo collection settings)
+    num_objects = 4,
+    default_obj_seq = [0,1,2],  # placeholder for env registration
+    room_size = 8,
+    num_rows = 1,
+    num_cols = 1,
+    # Training parameters
+    cloning_epochs = 10,
+    discovery_epochs = 10,
+    batch_size = 128,
+    gradient_accumulation_steps = None,
+    lr = 1e-4,
+    discovery_lr = 1e-4,
+    weight_decay = 0.03,
+    discovery_weight_decay = 0.03,
+    dim = 512,
+    depth = 2,
+    heads = 8,
+    dim_head = 64,
+    switch_temperature = 1.,
+    use_wandb = False,
+    wandb_project = "metacontroller-pinpad-bc",
+    wandb_run_name = None,
+    checkpoint_path = "transformer_pinpad_bc.pt",
+    meta_controller_checkpoint_path = "meta_controller_pinpad_discovery.pt",
+    load_transformer_weights_path = None,
+    load_meta_controller_weights_path = None,
+    save_steps = 1000,
+    state_loss_weight = 1.,
+    action_loss_weight = 1.,
+    discovery_action_recon_loss_weight = 1.,
+    discovery_kl_loss_weight = 0.15,
+    discovery_ratio_loss_weight = 0.,
+    discovery_switch_warmup_steps = 1,
+    discovery_switch_lr_scale = 0.1,
+    discovery_obs_loss_weight = 0.0,
+    max_grad_norm = 1.,
+    use_resnet = False,
+    condition_on_mission_embed = False,
+    mission_embed_dim = 384
+):
+    def store_checkpoint(step: int | None = None, is_discovering: bool = False):
+        if accelerator.is_main_process:
+            if exists(step):
+                checkpoint_path_with_step = checkpoint_path.replace('.pt', f'_step_{step}.pt')
+                meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path.replace('.pt', f'_step_{step}.pt')
+            else:
+                checkpoint_path_with_step = checkpoint_path
+                meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path
+
+            if not is_discovering:
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save(checkpoint_path_with_step)
+
+            if is_discovering:
+                unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
+                unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
+
+            accelerator.print(f"Model saved to {checkpoint_path_with_step}, MetaController to {meta_controller_checkpoint_path_with_step}")
+
+    # accelerator
+
+    accelerator = Accelerator(log_with = "wandb" if use_wandb else None)
+
+    if use_wandb:
+        init_kwargs = {}
+        if exists(wandb_run_name):
+            init_kwargs["wandb"] = {"name": wandb_run_name}
+        accelerator.init_trackers(
+            wandb_project,
+            config = {
+                "cloning_epochs": cloning_epochs,
+                "discovery_epochs": discovery_epochs,
+                "batch_size": batch_size,
+                "lr": lr,
+                "dim": dim,
+                "depth": depth,
+                "heads": heads,
+                "dim_head": dim_head,
+                "env_id": env_id,
+                "state_loss_weight": state_loss_weight,
+                "action_loss_weight": action_loss_weight,
+                "discovery_ratio_loss_weight": discovery_ratio_loss_weight
+            },
+            init_kwargs = init_kwargs
+        )
+
+    # replay buffer and dataloader
+
+    input_path = Path(input_dir)
+    assert input_path.exists(), f"Input directory {input_dir} does not exist"
+
+    replay_buffer = ReplayBuffer.from_folder(input_path)
+    dataloader = replay_buffer.dataloader(batch_size = batch_size)
+
+    # state shape and action dimension
+    # state: (B, T, H, W, C) where C is num_channels (one-hot encoded)
+
+    state_shape = replay_buffer.shapes['state']
+    if use_resnet: state_dim = 256
+    else:
+        state_dim = int(torch.tensor(state_shape).prod().item())
+
+    temp_env = create_pinpad_env(env_id, num_objects, default_obj_seq, room_size, num_rows, num_cols)
+    num_actions = int(temp_env.action_space.n)
+    temp_env.close()
+
+    accelerator.print(f"Detected state_dim: {state_dim}, num_actions: {num_actions} from env: {env_id}")
+    accelerator.print(f"State shape from replay buffer: {state_shape}")
+
+    meta_controller = MetaController(dim, switch_temperature=switch_temperature, ratio_loss_weight=discovery_ratio_loss_weight)
+
+    transformer_class = TransformerWithResnet if use_resnet else Transformer
+
+    transformer_kwargs = dict(
+        dim=dim,
+        state_embed_readout=dict(num_continuous=state_dim),
+        action_embed_readout=dict(num_discrete=num_actions),
+        lower_body=dict(depth=depth, heads=heads, attn_dim_head=dim_head),
+        upper_body=dict(depth=depth, heads=heads, attn_dim_head=dim_head),
+        meta_controller=meta_controller,
+    )
+
+    model = transformer_class(**transformer_kwargs)
+
+    if exists(load_transformer_weights_path):
+        _path = Path(load_transformer_weights_path)
+        assert _path.exists(), f"load_transformer_weights_path {load_transformer_weights_path} does not exist"
+        if hasattr(model, "load"):
+            model.load(str(_path))
+        else:
+            state = torch.load(_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state, strict=False)
+        accelerator.print(f"Loaded transformer weights from {load_transformer_weights_path}")
+    else:
+        for name, child in model.named_children():
+            if name != "meta_controller":
+                child.apply(initialize_weights_xavier)
+        accelerator.print("Initialized transformer with Xavier")
+
+    if exists(load_meta_controller_weights_path):
+        _path = Path(load_meta_controller_weights_path)
+        assert _path.exists(), f"load_meta_controller_weights_path {load_meta_controller_weights_path} does not exist"
+        if hasattr(meta_controller, "load"):
+            meta_controller.load(str(_path))
+        else:
+            state = torch.load(_path, map_location="cpu", weights_only=True)
+            meta_controller.load_state_dict(state, strict=False)
+        accelerator.print(f"Loaded meta_controller weights from {load_meta_controller_weights_path}")
+    else:
+        meta_controller.apply(initialize_weights_xavier)
+        accelerator.print("Initialized meta_controller with Xavier")
+
+    optim_model = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optim_meta_controller = AdamW([
+        {"params": meta_controller.discovery_parameters_non_switching(), "lr": discovery_lr},
+        {"params": meta_controller.discovery_parameters_switching_unit(), "lr": 0.0},
+    ], weight_decay=discovery_weight_decay)
+
+    # prepare
+
+    model, optim_model, optim_meta_controller, dataloader = accelerator.prepare(model, optim_model, optim_meta_controller, dataloader)
+
+    # training
+    gradient_step = 0
+    for epoch in range(cloning_epochs + discovery_epochs):
+
+        if is_discovering:
+            model.train_discovery()
+        else:
+            model.train()
+
+        total_losses = defaultdict(float)
+
+        progress_bar = tqdm(dataloader, desc = f"Epoch {epoch}", disable = not accelerator.is_local_main_process)
+
+        is_discovering = (epoch >= cloning_epochs)  # discovery phase is BC with metacontroller tuning
+
+        optim = optim_model if not is_discovering else optim_meta_controller
+
+        for batch in progress_bar:
+            # normalize inputs to be first in [0, 1] by dividing by 255
+            # then normalize w.r.t. mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]
+            states = batch['state'].float()
+            states = torch.clamp(states / 255.0, min=0.0, max=1.0)
+            states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
+
+            actions = batch['action'].long()
+            labels = batch.get('label')
+            if labels is not None:
+                labels = labels.long()
+            episode_lens = batch.get('_lens')
+
+            if condition_on_mission_embed and exists(mission_embeddings):
+                mission_embeddings = mission_embeddings.to(accelerator.device)
+            else:
+                mission_embeddings = None
+
+            if use_resnet:
+                states = model.visual_encode(states)
+            else: # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
+                states = rearrange(states, 'b t ... -> b t (...)')
+
+            with accelerator.accumulate(model):
+                losses, meta_controller_output = model(
+                    state=states,
+                    actions=actions,
+                    episode_lens=episode_lens,
+                    discovery_phase=is_discovering,
+                    force_behavior_cloning=not is_discovering,
+                    return_meta_controller_output=True,
+                    condition=mission_embeddings,
+                )
+
+                if is_discovering:
+                    obs_loss, action_recon_loss, kl_loss, ratio_loss = losses
+
+                    loss = (
+                        obs_loss * discovery_obs_loss_weight +
+                        action_recon_loss * discovery_action_recon_loss_weight +
+                        kl_loss * discovery_kl_loss_weight +
+                        ratio_loss * discovery_ratio_loss_weight
+                    )
+
+                    warmup_factor = min(1.0, (gradient_step + 1) / discovery_switch_warmup_steps)
+                    switch_lr = discovery_lr * discovery_switch_lr_scale * warmup_factor
+                    optim_meta_controller.param_groups[1]["lr"] = switch_lr
+
+                    log = dict(
+                        obs_loss=obs_loss.item(),
+                        action_recon_loss=action_recon_loss.item(),
+                        kl_loss=kl_loss.item(),
+                        ratio_loss=ratio_loss.item(),
+                        switch_density=meta_controller_output.switch_beta.mean().item(),
+                        switch_lr_warmup=warmup_factor,
+                    )
+
+                else:
+                    state_loss, action_loss = losses
+
+                    loss = (
+                        state_loss * state_loss_weight +
+                        action_loss * action_loss_weight
+                    )
+
+                    log = dict(
+                        state_loss = state_loss.item(),
+                        action_loss = action_loss.item(),
+                    )
+
+                if gradient_accumulation_steps is not None:
+                    loss /= gradient_accumulation_steps
+
+                # backprop
+
+                accelerator.backward(loss)
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = max_grad_norm)
+
+                if gradient_accumulation_steps is None or gradient_step % gradient_accumulation_steps == 0:
+                    optim.step()
+                    optim.zero_grad()
+
+            # log
+
+            for key, value in log.items():
+                total_losses[key] += value
+
+            if is_discovering:
+                prefix = "discovery_phase"
+            else:
+                prefix = "behavior_cloning"
+
+            accelerator.log({
+                **log,
+                f"{prefix}_total_loss": loss.item(),
+                f"{prefix}_grad_norm": grad_norm.item()
+            })
+
+            progress_bar.set_postfix(**log)
+            gradient_step += 1
+
+            # checkpoint
+
+            if gradient_step % save_steps == 0:
+                accelerator.wait_for_everyone()
+                store_checkpoint(gradient_step, is_discovering)
+
+                if is_discovering and use_wandb and accelerator.is_main_process and labels is not None:
+                    visualize_switch_betas_vs_labels(
+                        switch_betas=meta_controller_output.switch_beta,
+                        labels=labels,
+                        episode_lens=episode_lens,
+                        gradient_step=gradient_step,
+                        num_samples=3,
+                    )
+
+        avg_losses = {k: v / len(dataloader) for k, v in total_losses.items()}
+        avg_losses_str = ", ".join([f"{k}={v:.4f}" for k, v in avg_losses.items()])
+        accelerator.print(f"Epoch {epoch}: {avg_losses_str}")
+
+     # save weights
+    accelerator.wait_for_everyone()
+    store_checkpoint(None, is_discovering)
+
+    accelerator.end_training()
+
+if __name__ == "__main__":
+    fire.Fire(train)
